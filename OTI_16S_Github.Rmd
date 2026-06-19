@@ -1,0 +1,1792 @@
+---
+title: "OTI 16S analysis for: Scale-dependent structuring of sediment microbial communities on coral reefs"
+author: "S. Gardner"
+date: "19 June 2026"
+output: html_document
+---
+
+# Load packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(vegan)
+library(phyloseq)
+library(ggplot2)
+library(permute)
+library(lattice)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(genefilter)
+library(microbiome)
+library(tidyverse)
+library(tibble)
+library(corrplot)
+library(ggcorrplot)
+library(rstatix)
+library(Hmisc)
+library("DESeq2")
+library("forcats")
+library(tidytext)
+library(ggpubr)
+library(rcartocolor)
+```
+
+# Read in .RDS files
+```{r}
+ps.spatial <- readRDS("ps.spatial.rds") # Outer and spot
+ps.patch <- readRDS("ps.patch.rds") # patch reef
+ps.all <- readRDS("ps.all.rds") # seawater and sediment 
+
+# Sample table
+samptab <- read.csv("metadataOTI.csv", header = TRUE)
+rownames(samptab) <- samptab$SampleID
+samptab <- sample_data(samptab)
+```
+
+# 1. Drivers of sediment microbial communities at the lagoon-scale
+## Test for spatial autocorrelation
+package: adespatial - function dbmem
+```{r}
+library(ade4)
+library(spdep)
+library(sp)
+library(adegraphics)
+library(adespatial)
+
+ps.sedimentOR <- subset_samples(ps.spatial, Reef_area != "OuterReef")
+ps.sedimentOR <- prune_taxa(taxa_sums(ps.sedimentOR) > 1, ps.sedimentOR)
+
+unif <- phyloseq::distance(ps.sedimentOR, "wunifrac")
+unif <- as.matrix(unif)  # ensure it's a matrix
+dim(unif)
+all(rownames(unif) == colnames(unif))  # should be TRUE
+
+samptab <- read.csv("metadataOTI.csv", header = TRUE)
+rownames(samptab) <- samptab$SampleID
+
+df_contents <- samptab %>%
+  data.frame %>%
+  dplyr::filter(SampleID %in% sample_names(ps.sedimentOR)) %>%
+  dplyr::select(SampleID, Samplename, SiteName, SiteNumber, Sample_location, Lat, Long, Dcrest, Disland, Dlagoon, MaxDepth.m, TP.mg.kg, TN.mg.kg, TOCpercent, NP, MeanGrainsize,	Sorting,	Skewness,	Kurtosis,	D50um,	D50f,	GRAVELpercent,	SANDpercent,	MUDpercent, AvFlow, PeakFlow, FlowDirection, Chla, Pheo, ChlPheo)
+
+rownames(unif) <- df_contents$Samplename
+colnames(unif) <- df_contents$Samplename
+
+coords <- df_contents[, c("Long","Lat")]
+row.names(coords) <- df_contents$Samplename
+str(coords)
+
+rownames(unif)[1:10]  # should show 10 valid sample names
+coords <- coords[rownames(unif), ]
+dim(coords)  
+
+coords <- coords[rownames(unif), ]  # ensure same order
+
+rownames(unif)
+rownames(coords)
+
+coords_df <- as.data.frame(coords)
+dup_idx <- duplicated(coords_df)
+any(dup_idx)
+coords_df[dup_idx, ]  # see duplicates
+
+# Add tiny noise to duplicates to avoid identical coords
+set.seed(123)
+coords_jittered <- coords
+coords_jittered$Long <- jitter(coords_jittered$Long, amount = 1e-6)
+coords_jittered$Lat  <- jitter(coords_jittered$Lat,  amount = 1e-6)
+
+# Compute dbMEMs
+mem <- adespatial::dbmem(coords_jittered, silent = FALSE)
+mem <- as.data.frame(mem)
+head(mem)
+
+# Principal Coordinates Analysis on UniFrac distance
+pcoa <- cmdscale(unif, k = nrow(coords_jittered)-1, eig = TRUE)
+pcoa_axes <- as.data.frame(pcoa$points)
+
+# Forward selection with pcoa axes as response
+fs <- forward.sel(pcoa_axes, as.matrix(mem), adjR2thresh = RsquareAdj(rda(pcoa_axes ~ ., data = as.data.frame(mem)))$adj.r.squared)
+
+# 2 decimal places for fs table in supplementary
+fs_rounded <- fs
+numeric_cols <- sapply(fs_rounded, is.numeric)
+fs_rounded[, numeric_cols] <- round(fs_rounded[, numeric_cols], 3)
+
+# View selected MEMs
+fs
+selected_MEM_numbers <- sort(fs$order)
+mem_sel <- as.data.frame(mem)[, selected_MEM_numbers, drop=FALSE]
+
+# use mem_sel (significant MEMs) in your dbRDA
+dbRDA_model <- capscale(unif ~ ., data = mem_sel)
+
+anova(dbRDA_model, permutations = 999)
+
+anova(dbRDA_model, by = "term", permutations = 999)
+
+RsquareAdj(dbRDA_model)
+
+plot(dbRDA_model)
+
+# Visualise mems 
+mem_df <- as.data.frame(mem)
+mem_df$Long <- coords[,1]
+mem_df$Lat <- coords[,2]
+ 
+# Plot the first few dbMEMs
+for(i in 1:4){  # adjust number as needed
+  p <- ggplot(mem_df, aes(x = Long, y = Lat, color = mem_df[[i]])) +
+    geom_point(size = 4) +
+    scale_color_viridis_c() +
+    coord_equal() +
+    labs(title = paste0("dbMEM", i),
+         color = paste0("MEM", i)) +
+    theme_minimal()
+  print(p)} 
+
+# Plot MEM1 values across your sites
+ggplot(mem_df, aes(x = Long, y = Lat, color = MEM1)) +
+  geom_point(size = 4) +  scale_color_viridis_c() +   coord_equal() +  theme_minimal(base_size = 11) +
+  labs(title = "Spatial pattern of MEM1",  x = "Longitude", y = "Latitude", color = "MEM1 value") 
+
+# Keep only MEM1, MEM2, MEM4, 6, 7 and plot fig all together
+mem_long <- mem_df %>%
+  select(Long, Lat, MEM1, MEM2, MEM4, MEM6, MEM7) %>%
+  pivot_longer(cols = starts_with("MEM"), names_to = "MEM", values_to = "Value")
+
+# Plot with facets
+p <- ggplot(mem_long, aes(x = Long, y = Lat, color = Value)) +
+  geom_point(size = 4) +
+  scale_color_viridis_c() +   coord_equal() +  facet_wrap(~ MEM, nrow = 2) +  theme_minimal(base_size = 11) + theme_bw() +  labs(title = "Spatial patterns of significant dbMEMs", x = "Longitude", y = "Latitude", color = "MEM value")
+```
+
+## Correlation matrix
+```{r}
+ps.sedimentOR <- subset_samples(ps.spatial, Reef_area != "OuterReef")
+ps.sedimentOR <- prune_taxa(taxa_sums(ps.sedimentOR) > 1, ps.sedimentOR)
+
+unif <- phyloseq::distance(ps.sedimentOR, "wunifrac")
+df_contents <- samptab %>%
+  data.frame %>%
+  dplyr::filter(
+    SampleID %in% sample_names(ps.sedimentOR)) %>%
+  dplyr::select(SampleID, Samplename, SiteName, SiteNumber, Sample_location, Lat, Long, Dcrest, Disland, Dlagoon, MaxDepth.m, TP.mg.kg, TN.mg.kg, TOCpercent, NP, MeanGrainsize,	Sorting,	Skewness,	Kurtosis,	D50um,	D50f,	GRAVELpercent,	SANDpercent,	MUDpercent)
+
+df_all <- cbind(df_contents, mem_sel) ### CHECK ROW NAME ORDER FOR THESE
+all(rownames(df_contents) == rownames(mem_sel))
+which(rownames(df_contents) != rownames(mem_sel)) # which ones aren't matching
+
+# Update rownames of mem_sel to match df_contents
+rownames(mem_sel) <- gsub("_", "-", rownames(mem_sel))
+
+rownames(mem_sel)
+rownames(df_contents)
+
+df_all <- cbind(df_contents, mem_sel)
+
+# Check again
+all(rownames(df_contents) == rownames(mem_sel)) # TRUE
+which(rownames(df_contents) != rownames(mem_sel))
+
+# Correlation matrix
+cm6 <- cor(df_all %>%  dplyr::select(Disland, TP.mg.kg, TN.mg.kg, MUDpercent, MEM1, MEM2, MEM4, MEM6, MEM7)) 
+
+cm6 %>% cor()
+
+options(scipen = 999)
+
+p.mat6 <- rcorr(cm6, type = c("pearson")) # Correlation matrix with significance levels (p-value)
+p.mat6
+
+p.mat6$r # Extract the correlation coefficients
+p.mat6$P # Extract p-values
+
+# formatting a correlation matrix into a table with 4 columns containing
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut])}
+
+p.mat6 <- rcorr(as.matrix(cm6))
+flattenCorrMatrix(p.mat6$r, p.mat6$P)
+
+#check correlations visually 
+corrplot(cm6, order = 'FPC', type = 'lower', tl.col = 'black', number.cex = 0.65, method = 'color', diag = FALSE, addCoef.col = 'black', col = COL1(sequential = c("Purples"), n = 10)) # ordered based on FPC: first principal component order
+
+# Create table of p values, low /high confidence intervals
+testRes = cor.mtest(cm6, conf.level = 0.95)
+corrplot(cm6, order = 'AOE', type = 'lower', method = 'color', diag = FALSE, p.mat = testRes$p, sig.level = -1, insig = 'p-value')
+corrplot(cm6, order = 'AOE', type = 'lower', method = 'color', diag = FALSE, p.mat = testRes$p, sig.level = c(0.001, 0.01, 0.05), pch.cex = 0.9, insig = 'label_sig', pch.col = 'grey20') # Correlation plot showing p-values
+```
+
+### remove correlated variables:
+```{r}
+ps.sedimentOR <- subset_samples(ps.spatial, Reef_area != "OuterReef")
+ps.sedimentOR <- prune_taxa(taxa_sums(ps.sedimentOR) > 1, ps.sedimentOR) # n=69 samples, 76735 ASVs
+
+unif <- phyloseq::distance(ps.sedimentOR, "wunifrac")
+df_contents <- samptab %>%
+  data.frame %>%
+  dplyr::filter(
+    SampleID %in% sample_names(ps.sedimentOR)) %>%
+  dplyr::select(SampleID, Samplename, SiteName, SiteNumber, Sample_location, Lat, Long, Dcrest, Disland, Dlagoon, MaxDepth.m, TP.mg.kg, TN.mg.kg, TOCpercent, NP, MeanGrainsize,	Sorting,	Skewness,	Kurtosis,	D50um,	D50f,	GRAVELpercent,	SANDpercent,	MUDpercent)
+
+#Use Condition() to partial out spatial structure
+df_all <- cbind(df_contents, mem_sel) 
+all(rownames(df_contents) == rownames(mem_sel)) 
+which(rownames(df_contents) != rownames(mem_sel))
+
+# Update rownames of mem_sel to match df_contents
+rownames(mem_sel) <- gsub("_", "-", rownames(mem_sel))
+
+rownames(mem_sel)
+rownames(df_contents)
+
+df_all <- cbind(df_contents, mem_sel)
+
+# Check again
+all(rownames(df_contents) == rownames(mem_sel)) # TRUE
+which(rownames(df_contents) != rownames(mem_sel))
+
+# Correlation matrix
+cm6 <- cor(df_all %>% 
+            dplyr::select(Disland, TP.mg.kg, TN.mg.kg, MUDpercent, MEM4, MEM7)) 
+
+cm6 %>% cor()
+
+# p values matrix based on pearson correlation
+options(scipen = 999)
+
+p.mat6 <- rcorr(cm6, type = c("pearson"))
+p.mat6 # round(p.mat4, 2)
+
+p.mat6$r
+p.mat6$P 
+
+# formatting a correlation matrix into a table
+flattenCorrMatrix <- function(cormat, pmat) {
+  ut <- upper.tri(cormat)
+  data.frame(
+    row = rownames(cormat)[row(cormat)[ut]],
+    column = rownames(cormat)[col(cormat)[ut]],
+    cor  =(cormat)[ut],
+    p = pmat[ut]
+    )}
+
+p.mat6 <- rcorr(as.matrix(cm6))
+flattenCorrMatrix(p.mat6$r, p.mat6$P)
+
+#check correlations visually 
+corrplot(cm6, order = 'FPC', type = 'lower', tl.col = 'black', number.cex = 0.65, method = 'color', diag = FALSE, addCoef.col = 'black', col = COL1(sequential = c("Greens"), n = 10)) 
+
+# Create table of p values, low /high confidence intervals
+testRes = cor.mtest(cm6, conf.level = 0.95)
+corrplot(cm6, order = 'AOE', type = 'lower', method = 'color', diag = FALSE, p.mat = testRes$p, sig.level = -1, insig = 'p-value') # Correlation plot showing p-values
+
+corrplot(cm6, order = 'AOE', type = 'lower', method = 'color', diag = FALSE, p.mat = testRes$p, sig.level = c(0.001, 0.01, 0.05), pch.cex = 0.9, insig = 'label_sig', pch.col = 'grey20') 
+```
+
+## dbRDA
+```{r}
+ps.sedimentOR <- subset_samples(ps.spatial, Reef_area != "OuterReef")
+ps.sedimentOR <- prune_taxa(taxa_sums(ps.sedimentOR) > 1, ps.sedimentOR)
+
+unif <- phyloseq::distance(ps.sedimentOR, "wunifrac")
+unif <- as.matrix(unif)  # ensure it's a matrix
+dim(unif) # should be 69 69
+all(rownames(unif) == colnames(unif))  # should be TRUE
+
+samptab <- read.csv("metadataOTI.csv", header = TRUE)
+rownames(samptab) <- samptab$SampleID
+
+df_contents <- samptab %>%
+  data.frame %>%
+  dplyr::filter(SampleID %in% sample_names(ps.sedimentOR)) %>%
+  dplyr::select(SampleID, Samplename, SiteName, SiteNumber, Sample_location, Lat, Long, Dcrest, Disland, Dlagoon, MaxDepth.m, TP.mg.kg, TN.mg.kg, TOCpercent, NP, MeanGrainsize,	Sorting,	Skewness,	Kurtosis,	D50um,	D50f,	GRAVELpercent,	SANDpercent,	MUDpercent)
+#df_contents$Samplename
+
+rownames(unif) <- df_contents$Samplename
+colnames(unif) <- df_contents$Samplename
+
+rownames(unif) <- df_contents$Samplename
+colnames(unif) <- df_contents$Samplename
+
+coords <- df_contents[, c("Long","Lat")]
+row.names(coords) <- df_contents$Samplename str(coords)
+
+rownames(unif)[1:10]
+coords <- coords[rownames(unif), ]
+dim(coords) 
+
+coords <- coords[rownames(unif), ] 
+
+rownames(unif)
+rownames(coords)
+
+coords_df <- as.data.frame(coords)
+dup_idx <- duplicated(coords_df)
+any(dup_idx)
+coords_df[dup_idx, ]
+
+# Add tiny noise to duplicates to avoid identical coords
+set.seed(123)
+coords_jittered <- coords
+coords_jittered$Long <- jitter(coords_jittered$Long, amount = 1e-6)
+coords_jittered$Lat  <- jitter(coords_jittered$Lat,  amount = 1e-6)
+
+# Compute dbMEMs
+mem <- adespatial::dbmem(coords_jittered, silent = FALSE)
+mem <- as.data.frame(mem)
+head(mem)
+
+# Principal Coordinates Analysis on UniFrac distance
+pcoa <- cmdscale(unif, k = nrow(coords_jittered)-1, eig = TRUE)
+pcoa_axes <- as.data.frame(pcoa$points)
+
+# Forward selection with pcoa axes as response
+fs <- forward.sel(pcoa_axes, as.matrix(mem),
+                  adjR2thresh = RsquareAdj(rda(pcoa_axes ~ ., data = as.data.frame(mem)))$adj.r.squared)
+
+# 2 decimal places for fs table in supplementary
+fs_rounded <- fs
+numeric_cols <- sapply(fs_rounded, is.numeric)
+fs_rounded[, numeric_cols] <- round(fs_rounded[, numeric_cols], 3)
+
+# View selected MEMs
+fs
+selected_MEM_numbers <- sort(fs$order)
+mem_sel <- as.data.frame(mem)[, selected_MEM_numbers, drop=FALSE]
+
+# use mem_sel (significant MEMs) in your dbRDA
+dbRDA_model <- dbrda(unif ~ ., data = mem_sel)
+
+anova(dbRDA_model, by = "term", permutations = 999)
+
+plot(dbRDA_model)
+
+#Use Condition() to partial out spatial structure
+df_all <- cbind(df_contents, mem_sel) 
+all(rownames(df_contents) == rownames(mem_sel))
+which(rownames(df_contents) != rownames(mem_sel)) 
+
+# Update rownames of mem_sel to match df_contents
+rownames(mem_sel) <- gsub("_", "-", rownames(mem_sel))
+
+rownames(mem_sel)
+rownames(df_contents)
+
+df_all <- cbind(df_contents, mem_sel)
+
+# Check again
+all(rownames(df_contents) == rownames(mem_sel)) # TRUE
+which(rownames(df_contents) != rownames(mem_sel))
+
+# MEMs as spatial covariates
+# Condition - to account for spatial autocorrelation and isolate the effect of your variables
+dbrda_partial <- dbrda(unif ~ Disland + TP.mg.kg + TN.mg.kg + MUDpercent + Condition(MEM4, MEM7), data = df_all)
+
+# VIF scores
+sort(vif.cca(dbrda_partial))
+
+# Global test of environmental variables
+anova(dbrda_partial, permutations = 999)
+
+# Test each term separately
+anova(dbrda_partial, by = "term", permutations = 999)
+
+# Get adjusted R²
+RsquareAdj(dbrda_partial)
+
+plot(dbrda_partial)
+
+RsquareAdj(dbrda(unif ~ Disland + TP.mg.kg + TN.mg.kg + MUDpercent + Condition(MEM4, MEM7), data = df_all))
+```
+
+### Plot
+```{r}
+eigvals <- dbrda_partial$CA$eig
+propvar <- eigvals / sum(eigvals)
+
+axis1_lab <- paste0("dbRDA1 (", round(propvar[1] * 100, 1), "%)")
+axis2_lab <- paste0("dbRDA2 (", round(propvar[2] * 100, 1), "%)")
+
+plot_df <- vegan::scores(dbrda_partial, display = "sites") %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "SampleIDb") %>%
+  left_join(., samptab) %>%
+  select(dbRDA1, dbRDA2, SiteName) #
+
+cents <- plot_df %>%
+  group_by(SiteName) %>%
+  summarise(dbRDA1_C = mean(dbRDA1), 
+            dbRDA2_C = mean(dbRDA2))
+
+vectors <- as.data.frame(dbrda_partial$CCA$biplot) %>% tibble::rownames_to_column(var = "label")
+
+plot_df_c <- left_join(plot_df, cents) %>%
+  left_join(dist_island, by = "SiteName")
+
+SiteNames <- sort(unique(cents$SiteName))
+sitepal <- c("blue4","dodgerblue2","darkorange4","tan4","darkorchid3","mediumpurple3","red3","forestgreen","steelblue4","deeppink1","indianred2","cornflowerblue", "green1","orchid1", "yellowgreen","magenta","darkturquoise","gray70","gold1","yellow3","yellow4")
+names(sitepal) <- SiteNames
+
+RDAALL <- ggplot(plot_df_c, aes(dbRDA1_C, dbRDA2_C)) + 
+  geom_segment(aes(x = dbRDA1_C, xend = dbRDA1, y = dbRDA2_C, yend = dbRDA2, color = SiteName)) + 
+  geom_segment(aes(x = 0, y = 0, xend = dbRDA1, yend = dbRDA2), arrow = arrow(length = unit(0.3, "cm")), colour = "black", size = 1, data = vectors) +
+  geom_text(aes(x = dbRDA1, y = dbRDA2, label = label), data = vectors) +
+  geom_point(aes(fill = SiteName, size = 5), shape = 21) + 
+  scale_fill_manual("SiteName", values = sitepal) +
+  scale_colour_manual("SiteName", values = sitepal) +
+  scale_x_reverse() +
+  theme_classic(base_size = 11) + theme(plot.background = element_blank(),  panel.grid = element_blank(), axis.text.y = element_text(colour = "black", size = 11),axis.title.x = element_text(colour = "black", size = 11),
+        axis.title.y = element_text(colour = "black", size = 11),  legend.title = element_text(size = 11),legend.text = element_text(size = 11)) + guides(fill = guide_legend(ncol = 1), color = guide_legend(override.aes = list(size=5))) +  xlab(axis1_lab) +  ylab(axis2_lab) + coord_flip()
+
+## Coloured by distance from island gradient, labelled SITENAME
+RDAALL2 <- ggplot(plot_df_c, aes(dbRDA1_C, dbRDA2_C)) + 
+  geom_segment(aes(x = 0, y = 0, xend = dbRDA1, yend = dbRDA2), arrow = arrow(length = unit(0.3, "cm")), colour = "black", size = 1, data = vectors) +
+   geom_text(aes(x = dbRDA1, y = dbRDA2, label = label), data = vectors) +
+  geom_point(aes(fill = distance_m), size = 12, shape = 21, colour = "black", stroke = 0.5) + 
+  geom_text(aes(label = SiteName),  data = plot_df_c,  colour = "black",  nudge_y = 0.05, vjust = 1) +
+   scale_fill_viridis_c(name = "Distance from island (m)",  option = "D",  direction = 1,  breaks = scales::pretty_breaks(n = 4)) +
+  scale_x_reverse() +  theme_classic(base_size = 11) +    theme(text = element_text(size = 11, colour = "black"),  plot.background = element_blank(),  panel.grid = element_blank(),  legend.title = element_text(size = 11),    legend.text = element_text(size = 11)) +  guides(fill = guide_legend(ncol = 1),  color = guide_legend(override.aes = list(size=5))) + xlab(axis1_lab) +
+  ylab(axis2_lab) + coord_flip()
+```
+
+### dbRDA: Site constraint
+```{r}
+unif <- phyloseq::distance(ps.sedimentOR, "wunifrac")
+df_contents <- samptab %>%
+  data.frame %>%
+  dplyr::filter(SampleID %in% sample_names(ps.sedimentOR)) %>%
+  dplyr::select(SampleID, Samplename, SiteName, Sample_location, Reef_area)
+
+# ***** Site features ***** 
+dbrda_ll <- dbrda(unif ~ SiteName, data = df_contents)
+
+# Check the vif scores of the full model
+sort(vif.cca(dbrda_ll))
+
+dbrdastep <- ordistep(dbrda_ll, direction = "backward", permutations = 999)  
+anova(dbrdastep, by = 'margin')
+
+R2adj <- RsquareAdj(dbrda_ll)$adj.r.squared
+R2adj 
+
+summary(dbrda_ll)
+```
+
+# 2. Microbial community structure across reef microhabitats
+
+## Beta diversity: Full dataset
+```{r echo=TRUE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+trans.adonis <- filter_taxa(ps.patch, function(x) sum(x) > 0.01, TRUE)
+trans.adonis <- transform_sample_counts(trans.adonis, function(x) x / sum(x))
+trans.adonis <- microbiome::transform(trans.adonis, transform = "hellinger", target = "OTU", shift = 0, scale = 1)
+
+unifrac <- phyloseq::distance(trans.adonis, method = "unifrac", weighted = TRUE)
+sampledf <- data.frame(sample_data(trans.adonis))
+
+adonis2(formula = unifrac ~ SiteName * Sample_location, data = sampledf, by = "terms") 
+
+# LOCATION:
+beta <- betadisper(unifrac, sampledf$Sample_location)
+boxplot(beta)
+anova(beta) 
+
+TukeyHSD(beta)
+beta.HSD <- TukeyHSD(beta)
+plot(beta.HSD)
+
+plot(beta)
+
+# Permutest Null hypothesis of no difference in dispersion between groups
+permutest(beta, pairwise = TRUE, permutations = 9999)
+
+## SITE
+beta <- betadisper(unifrac, sampledf$SiteName)
+boxplot(beta)
+anova(beta) 
+
+TukeyHSD(beta)
+beta.HSD <- TukeyHSD(beta)
+plot(beta.HSD)
+
+plot(beta)
+
+# Permutest Null hypothesis of no difference in dispersion between groups
+permutest(beta, pairwise = TRUE, permutations = 9999)
+```
+
+## PCoA with vectors - Sample location
+```{r}
+trans.adonis <- filter_taxa(ps.patch, function(x) sum(x) > 0.01, TRUE)
+trans.adonis <- transform_sample_counts(trans.adonis, function(x) x / sum(x))
+trans.adonis <- microbiome::transform(trans.adonis, transform = "hellinger", target = "OTU", shift = 0, scale = 1)
+
+unifrac <- phyloseq::distance(trans.adonis, method = "unifrac", weighted = TRUE)
+sampledfpatch <- data.frame(sample_data(trans.adonis))
+
+unif <- phyloseq::distance(ps.patch, "wunifrac")
+df_contents <- samptab %>%
+  data.frame %>%
+  dplyr::filter(SampleID %in% sample_names(ps.patch)) %>%
+  dplyr::select(SampleID, Samplename, SiteNumber, Sample_location, Reef_area, Disland, Dcrest)
+
+
+pcoa_res <- wcmdscale(unif)
+env_res <- envfit(pcoa_res, df_contents, permutations = 999)
+vectors <- as.data.frame(scores(env_res,  display = "vectors")) %>% tibble::rownames_to_column(var = "label")
+
+plot_df <- vegan::scores(pcoa_res, display = "sites") %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "SampleID") %>%
+  left_join(., sampledfpatch)
+
+unif.ord <- ordinate(ps.patch, method = "PCoA", unif)
+p_jacc <- plot_ordination(ps.patch, unif.ord, color = "Sample_location", shape = "Sample_location")
+p_jacc + geom_point(size = 4) + theme_bw() + theme_classic() +
+  theme(text = element_text(size = 11)) + stat_ellipse(aes(colour = Sample_location, group = Sample_location), level = 0.80) +
+  #labs("Sample_location") +
+  scale_color_manual(values=c("blue4","dodgerblue2","red3","forestgreen","steelblue4","deeppink1","indianred2","cornflowerblue", "green1","orchid1", "yellowgreen","magenta","darkturquoise")) +
+  scale_shape_manual(values = c(17, 18, 19), name = "Sample_location") +
+  theme(axis.text.x=element_text(colour="black")) +
+  theme(axis.text.y=element_text(colour="black"))
+
+# get variance explained
+eigvals <- unif.ord$values$Eigenvalues
+var_explained <- eigvals / sum(eigvals)
+x_lab <- paste0("PCoA1 (", round(var_explained[1]*100, 1), "%)")
+y_lab <- paste0("PCoA2 (", round(var_explained[2]*100, 1), "%)")
+
+library(ggalt)  # for geom_encircle
+sampdf <- data.frame(sample_data(ps.patch))
+sampdf$SiteName <- factor(sampdf$SiteName) # Make sure Site is a factor
+sample_data(ps.patch) <- sampdf # Put back into ps.patch 
+sample_data(ps.patch)$SiteName <- factor(sample_data(ps.patch)$SiteName)
+
+locations <- sort(unique(sample_data(ps.patch)$Sample_location))
+location_colors <- c("brown1", "aquamarine4", "goldenrod1")
+names(location_colors) <- locations 
+
+plot_ordination(ps.patch, unif.ord, color = "Sample_location", shape = "Sample_location") +
+  geom_point(size = 6) +
+  geom_encircle(aes(group = Sample_location, fill = Sample_location), alpha = 0.55, s_shape = 1,  expand = 0, show.legend = FALSE) +
+  scale_color_manual(name = "Sample location",  values = location_colors) +
+  scale_fill_manual(values = location_colors) +
+  scale_shape_manual(name = "Sample location", values = c(15, 16, 17)) +
+  labs(x = "PCoA1", y = "PCoA2") +  theme_bw(base_size = 11) +  theme(aspect.ratio = 1, legend.position = "bottom", axis.text = element_text(colour = "black")) +  facet_wrap(~SiteName, ncol = 5)
+```
+
+## Relative abundance:
+## Patch [Phylum level] overall
+```{r}
+glom <- tax_glom(ps.patch, taxrank = "Phylum")
+
+trans <- transform_sample_counts(glom, function(x) x/sum(x)*100)
+trans <- filter_taxa(trans, function(x) mean(x) > 0.01, TRUE) # Filters out anything with a relative abundance under 1%
+
+totalpatch.abund <- psmelt(trans) %>%
+  group_by(Phylum) %>%
+  summarise(Relative_abun = sum(Abundance/n()),
+            SE_rel = sd(Abundance)/sqrt(n()))
+```
+
+## Family level
+```{r}
+glom <- tax_glom(ps.patch, taxrank = "Family")
+
+ps.rel <- glom %>%
+  transform_sample_counts(function(x) x / sum(x))
+
+# Identify rare phyla with mean relative abundance <1%
+rare_phyla <- taxa_sums(glom) / nsamples(ps.rel) < 0.01
+tax_table(ps.rel)[rare_phyla, "Family"] <- "Other"
+
+# Collapse again to group rare as 'Other'
+ps.rel.merged <- tax_glom(ps.rel, taxrank = "Family")
+
+# Melt and summarise
+relabun_sum <- psmelt(ps.rel.merged) %>%
+  group_by(Sample_location, Family) %>%
+  summarise(Relative_abun = mean(Abundance) * 100,
+            SE_rel = sd(Abundance) * 100 / sqrt(n()), .groups = "drop")
+
+# Put Other last in legend
+relabun_sum$Family <- factor(relabun_sum$Family,
+  levels = c(sort(unique(relabun_sum$Family[relabun_sum$Family != "Other"])), "Other"))
+
+relabun_sum$Sample_location = factor(relabun_sum$Sample_location, levels = c("Inner", "Edge", "Outer"))
+length(unique(relabun_sum$Family)) # 22 unique familes
+
+# Build colour palette
+library(RColorBrewer)
+phyla_names <- levels(relabun_sum$Family)
+base_colors <- brewer.pal(min(length(phyla_names), 22), "Paired")
+mycolors <- colorRampPalette(base_colors)(length(phyla_names))
+names(mycolors) <- phyla_names
+
+# overwrite "Other" to be light grey
+mycolors["Other"] <- "lightgrey"
+
+# Plot
+ggplot(relabun_sum, aes(x = Sample_location, y = Relative_abun, fill = Family)) +
+  geom_bar(stat = "identity", colour = "black", position = "fill") +
+  facet_wrap(~Sample_location, scales = "free_x", ncol = 3) +
+  scale_fill_manual(values = mycolors) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw(base_size = 11) +
+  theme(aspect.ratio = 1,  legend.position = "right",  axis.text.x = element_blank(),  legend.title = element_text(size = 11), legend.text = element_text(size = 11)) +
+  guides(fill = guide_legend(ncol = 1, byrow = TRUE)) +
+  xlab("Sample location") +
+  ylab("Relative Abundance (%)")
+```
+
+### plot top 20 families
+```{r}
+glom <- tax_glom(ps.patch, taxrank = "Family")
+
+# Transform to relative abundance
+ps.rel <- glom %>%
+  transform_sample_counts(function(x) x / sum(x))
+
+# Calculate mean relative abundance (%) per site and sample location
+relabun_sum <- psmelt(ps.rel) %>%
+  group_by(SiteName, Sample_location, Family) %>%
+  summarise(
+    Mean_rel_abun = mean(Abundance) * 100,
+    .groups = "drop")
+
+# Identify top 20 families across the entire dataset
+top20_families <- relabun_sum %>%
+  group_by(Family) %>%
+  summarise(
+    Total_abun = sum(Mean_rel_abun),  .groups = "drop") %>%
+  slice_max(order_by = Total_abun,  n = 20,  with_ties = FALSE) %>%
+  pull(Family)
+
+# Keep only top 20 families, group remainder as "Other"
+relabun_top20 <- relabun_sum %>%
+  mutate(Family = ifelse(Family %in% top20_families,  as.character(Family),  "Other")) %>%
+  group_by(Sample_location, Family) %>%
+  summarise(Mean_rel_abun = sum(Mean_rel_abun),  .groups = "drop")
+
+# Order factors
+relabun_top20$Family <- factor(relabun_top20$Family,  levels = c(sort(unique(relabun_top20$Family[relabun_top20$Family != "Other"])),"Other"))
+
+relabun_top20$Sample_location <- factor(relabun_top20$Sample_location,  levels = c("Inner", "Edge", "Outer"))
+
+# Create colour palette
+fam_levels <- levels(relabun_top20$Family)
+
+base_cols <- brewer.pal(12, "Paired")
+
+pal <- colorRampPalette(base_cols)(length(fam_levels))
+names(pal) <- fam_levels
+pal["Other"] <- "lightgrey"
+
+# Plot
+ggplot(relabun_top20,  aes(x = Sample_location,  y = Mean_rel_abun,  fill = Family)) +
+  geom_col(position = "fill", colour = "black",  width = 1) + 
+  facet_wrap(~Sample_location,  scales = "free_x", ncol = 3) +
+  scale_fill_manual(values = pal) +
+  scale_y_continuous(labels = scales::percent) +
+  theme_bw(base_size = 11) +
+  guides(fill = guide_legend(ncol = 4)) +
+  theme(axis.text.x = element_text(  angle = 90,  vjust = 0.5,  hjust = 1),  legend.position = "bottom",strip.text = element_text(size = 11)) +  labs(
+    x = "Sample location",  y = "Relative abundance (%)",  fill = "Family",  title = "Top 20 microbial families across all sample locations")
+```
+
+### rel abun top 3 for each microhabitat 
+```{r}
+top3_per_loc <- relabun_sum %>%
+  group_by(Sample_location) %>%
+  arrange(desc(Relative_abun)) %>%
+  slice_head(n = 3) %>% 
+  ungroup() %>%
+  distinct(Sample_location, Family) 
+relabun_top3 <- relabun_sum %>%
+  semi_join(top3_per_loc, by = c("Sample_location", "Family"))
+
+# reate a plotting factor ordered by Relative_abun **per microhabitat**
+relabun_top3 <- relabun_top3 %>%
+  group_by(Sample_location) %>%
+  arrange(desc(Relative_abun)) %>%
+  mutate(Family_ordered = factor(Family, levels = Family)) %>%
+  ungroup()
+
+relabun_top3$Family
+
+family_colors <- c("Xenococcaceae" = "steelblue4",  "Flavobacteriaceae"   = "#257CB2",  "Woeseiaceae" = "#72B29C",  "Ilumatobacteraceae" = "#A6CEE3",  "Pirellulaceae" = "#A5D981")
+
+ggplot(relabun_top3, aes(x = Family_ordered, y = Relative_abun, fill = Family_ordered)) +
+  geom_col(colour = "black") +
+  geom_errorbar(aes(ymin = Relative_abun - SE_rel,  ymax = Relative_abun + SE_rel), width = 0.2) +
+  facet_wrap(~Sample_location, scales = "free_x", ncol = 3) +
+  scale_fill_manual(values = family_colors) +
+   scale_y_continuous(labels = scales::percent_format(scale = 1), limits = c(0, 10)) + 
+  labs(x = "Family", fill = "Family", y = "Mean rel. abun (%) ± SE") + theme_bw() +
+    theme(aspect.ratio = 1, legend.position = "right",  text = element_text(size = 11),    axis.text.y = element_text(colour = "black", size = 11), axis.title.y = element_text(colour = "black", size = 11),
+          axis.text.x = element_text(colour = "black", size = 11, angle = 90, vjust = 0.5, hjust = 1), axis.title.x = element_text(colour = "black", size = 11), legend.title = element_text(size = 11), legend.text = element_text(size = 11))
+```
+
+## Rel abun - facet
+```{r}
+library(RColorBrewer)
+glom <- tax_glom(ps.patch, taxrank = "Family")
+
+glom_rel <- transform_sample_counts(glom, function(x) x / sum(x))
+
+df <- psmelt(glom_rel)
+
+top_taxa <- df %>%
+  group_by(Sample_location, Family) %>%
+  summarise(mean_abund = mean(Abundance), .groups = "drop") %>%
+  group_by(Sample_location) %>%
+  slice_max(mean_abund, n = 10) %>%
+  ungroup()
+
+df_top <- df %>%  semi_join(top_taxa, by = c("Sample_location", "Family"))
+
+df_sum <- df_top %>%
+  group_by(Sample_location, Family) %>%
+  summarise(mean_abund = mean(Abundance),  se_abund = sd(Abundance) / sqrt(n()),.groups = "drop")
+
+df_sum$Family <- reorder(df_sum$Family, df_sum$mean_abund)
+
+n_fam <- length(unique(df_top$Family))
+
+pal <- colorRampPalette(brewer.pal(8, "Paired"))(n_fam)
+
+ggplot(df_sum, aes(x = Family, y = mean_abund, fill = Family)) +
+  geom_col() +
+  geom_errorbar(aes(ymin = mean_abund - se_abund,  ymax = mean_abund + se_abund),  width = 0.2) +
+  facet_wrap(~ Sample_location, scales = "free_x") +
+  scale_fill_manual(values = pal) +  theme_bw() +
+  theme(aspect.ratio = 1, legend.position = "right",  text = element_text(size = 11),  axis.text.y = element_text(colour = "black", size = 11), axis.title.y = element_text(colour = "black", size = 11),
+          axis.text.x = element_text(colour = "black", size = 11, angle = 90, vjust = 0.5, hjust = 1), axis.title.x = element_text(colour = "black", size = 11), legend.title = element_text(size = 11), legend.text = element_text(size = 11)) + labs(x = "Taxa (Family)",  y = "Relative abundance ± SE")
+
+df_sum$Family <- factor(df_sum$Family,
+                        levels = df_sum %>%
+                          group_by(Family) %>%
+                          summarise(m = mean(mean_abund)) %>%
+                          arrange(m) %>%
+                          pull(Family))
+
+df_sum$Sample_location <- factor(df_sum$Sample_location,  levels = c("Inner", "Edge", "Outer"))
+df_sum <- df_sum %>%  filter(Family != "Feb-10")
+
+n_fam <- length(unique(df_sum$Family))
+pal <- colorRampPalette(brewer.pal(10, "Paired"))(n_fam)
+
+ggplot(df_sum, aes(x = Sample_location, y = mean_abund, fill = Family)) +
+  geom_col() +  geom_errorbar(aes(ymin = mean_abund - se_abund,  ymax = mean_abund + se_abund),  width = 0.2) +
+  facet_wrap(~ Family, scales = "free_y", ncol = 4) +  scale_fill_manual(values = pal) +  theme_bw() + theme(aspect.ratio = 1, legend.position = "right",  text = element_text(size = 11),  axis.text.y = element_text(colour = "black", size = 11), axis.title.y = element_text(colour = "black", size = 11),  axis.text.x = element_text(colour = "black", size = 11, angle = 90, vjust = 0.5, hjust = 1), axis.title.x = element_text(colour = "black", size = 11),legend.title = element_text(size = 11), legend.text = element_text(size = 11)) + labs(x = "Sample location", y = "Relative abundance (%) ± SE")
+```
+
+## Alpha diversity 
+```{r}
+library(rstatix)
+
+sample_sums(ps.patch)
+
+reads_per_sample <- tibble(
+  SampleID = sample_names(ps.patch),
+  Reads    = sample_sums(ps.patch))
+
+reads_per_sample
+
+mean(sample_sums(ps.patch)) 
+summary(sample_sums(ps.patch))
+
+
+smallest <- min(sample_sums(ps.patch))
+r <- rarefy_even_depth(ps.patch, sample.size = 19635, verbose = FALSE, replace = TRUE) # rarify to 19635 1st quartile
+
+# prune OTUs that are not present in any of the samples, using rarefied data
+ps.patch.pruned <- prune_taxa(taxa_sums(r) > 0, r)
+
+sites <- c("OTI13", "OTI14", "OTI15", "Alt1",  "OTI10", "OTI06", "OTI07", "OTI12", "OTI08", "OTI05", "OTI01", "OTI03", "Alt2")
+site_colors <- c("yellowgreen","magenta","darkturquoise", "blue4","green1", "deeppink1","indianred2","orchid1", "cornflowerblue", "steelblue4","red3","forestgreen","dodgerblue2")
+names(site_colors) <- sites 
+
+alphpatch <- plot_richness(ps.patch, x = "Sample_location", measures = c("Shannon", "Chao1")) +
+  geom_boxplot(aes(fill = Sample_location)) +
+  theme_bw() +
+  theme(aspect.ratio = 2, legend.position = "right") +
+  theme(text = element_text(size = 11),   axis.text.y = element_text(colour = "black", size = 11),axis.title.y = element_text(colour = "black", size = 11),  legend.title = element_text(size = 11),  legend.text = element_text(size = 11),  axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, colour = "black", size = 11)) + ylab("Alpha diversity") +  xlab("Sample location")
+```
+
+#### Chao1
+```{r}
+library(car)
+library(rstatix)
+
+results.chao = estimate_richness(ps.patch.pruned, measures = 'Chao1')
+head(results.chao)
+
+results.chao <- results.chao %>%
+  tibble::rownames_to_column(var = "SampleID")
+   results.chao$SampleID <- str_replace(results.chao$SampleID, "A", "XA")
+
+meta <- data.frame(SampleID = sample_data(ps.patch.pruned)$SampleID, 
+                   SiteName = sample_data(ps.patch.pruned)$SiteName,
+                   Sample_location = sample_data(ps.patch.pruned)$Sample_location)
+meta$SampleID <- str_replace(meta$SampleID, "^", "X")
+meta$SampleID <- str_replace(meta$SampleID, "-", ".")
+meta$SampleID <- str_replace(meta$SampleID, "-E", ".E")
+meta$SampleID <- str_replace(meta$SampleID, "-I", ".I")
+meta$SampleID <- str_replace(meta$SampleID, "-O", ".O")
+
+results.chao <- left_join(results.chao, meta)
+
+Chao.summary <- results.chao %>%  group_by(SiteName) %>% 
+                    get_summary_stats(Chao1, type = "common")
+
+results.chao.aov <- aov(Chao1 ~ SiteName * SiteName/Sample_location, data = results.chao) # two-way anova with species Sample_location nested in SiteName
+
+summary(results.chao.aov)
+
+TukeyHSD(results.chao.aov)
+
+leveneTest(Chao1 ~ SiteName * SiteName/Sample_location, data = results.chao) # Check homogeneity of variances using Levenes
+
+# Check normality
+plot(results.chao.aov, 1)
+plot(results.chao.aov, 2)
+aov_residuals <- residuals(object = results.chao.aov)
+shapiro.test(x = aov_residuals) # p-value = 0.9353 assumption of normality IS satisfied under shapiros
+```
+
+#### Shannon
+```{r}
+results.shan = estimate_richness(ps.patch.pruned, measures = 'Shannon')
+
+results.shan <- results.shan %>%
+  tibble::rownames_to_column(var = "SampleID")
+
+meta <- data.frame(SampleID = sample_data(ps.patch.pruned)$SampleID, 
+                   SiteName = sample_data(ps.patch.pruned)$SiteName,
+                   Sample_location = sample_data(ps.patch.pruned)$Sample_location)
+results.shan <- left_join(results.shan, meta)
+
+Shan.summary <- results.shan %>%
+                    group_by(SiteName) %>% 
+                    get_summary_stats(Shannon, type = "common") 
+
+res.shan.aov <- aov(Shannon ~ SiteName * SiteName/Sample_location, data = results.shan)
+
+summary(res.shan.aov)
+                                                                                             
+TukeyHSD(res.shan.aov)
+
+leveneTest(Shannon ~ SiteName * SiteName/Sample_location, data = results.shan)
+              
+# Check normality
+plot(res.shan.aov, 1) 
+plot(res.shan.aov, 2)
+aov_residuals <- residuals(object = res.shan.aov)
+shapiro.test(x = aov_residuals)
+```
+
+## Differential abundance
+```{r}
+ps.fam <- tax_glom(ps.patch, taxrank = "Family")
+
+gm_mean = function(x, na.rm=TRUE){  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))}
+
+resultstax <- as.data.frame(tax_table(ps.fam)@.Data)
+resultstax <- rownames_to_column(resultstax, var = "SampleID") 
+
+alpha = 0.05
+ds2zeros = phyloseq_to_deseq2(ps.fam, ~ SiteName * Sample_location) 
+
+# Test for interaction
+dsq_LRT_interaction <- DESeq(ds2zeros, test = "LRT",
+                            reduced = ~ SiteName + Sample_location)
+
+res_interaction$padj < 0.05
+res_interaction <- results(dsq_LRT_interaction)
+res_interaction$padj
+
+summary(res_interaction)
+
+sum(res_interaction$padj < 0.05, na.rm = TRUE) 
+sum(!is.na(res_interaction$padj)) 
+table(res_interaction$padj < 0.05, useNA = "ifany")
+
+## PLOTTING GLOBAL RESULTS
+# Count significant families
+summary_counts <- tibble(
+  Effect = c("Microhabitat", "Site", "Interaction"),
+  n_sig = c(sum(res_interaction$padj < alpha, na.rm = TRUE), sum(res_interaction$padj < alpha, na.rm = TRUE), sum(res_interaction$padj < alpha, na.rm = TRUE)))
+
+plot_A_global <- ggplot(summary_counts,
+                       aes(x = Effect, y = n_sig)) +
+  geom_col(width = 0.7) +
+  theme_bw() +  theme(panel.grid = element_blank(),  axis.text.x = element_text(size = 11),  axis.text.y = element_text(size = 11)) +
+  labs( x = "Effect",   y = "Number of significant families",  title = "Global tests of site and microhabitat effects")
+
+# This shows how many taxa are: unique to each effect, shared across effects
+res_microhab_df    <- as.data.frame(res_microhab)
+res_site_df        <- as.data.frame(res_site)
+res_interaction_df <- as.data.frame(res_interaction)
+
+# Add row column ONLY if it doesn't already exist
+if (!"row" %in% colnames(res_microhab_df)) {
+  res_microhab_df$row <- rownames(res_microhab_df)
+}
+if (!"row" %in% colnames(res_site_df)) {
+  res_site_df$row <- rownames(res_site_df)
+}
+if (!"row" %in% colnames(res_interaction_df)) {
+  res_interaction_df$row <- rownames(res_interaction_df)
+}
+
+overlap_df <- dplyr::full_join(
+  res_microhab_df[, c("row", "padj")] %>% 
+    dplyr::rename(padj_micro = padj),
+  res_site_df[, c("row", "padj")] %>% 
+    dplyr::rename(padj_site = padj),
+  by = "row"
+) %>%
+  dplyr::full_join(
+    res_interaction_df[, c("row", "padj")] %>% 
+      dplyr::rename(padj_inter = padj),
+    by = "row"
+  ) %>%
+  dplyr::mutate(
+    micro_sig = !is.na(padj_micro) & padj_micro < alpha,
+    site_sig  = !is.na(padj_site)  & padj_site  < alpha,
+    inter_sig = !is.na(padj_inter) & padj_inter < alpha
+  )
+
+overlap_summary <- overlap_df %>%
+  dplyr::mutate(
+    category = dplyr::case_when(
+      micro_sig & !site_sig & !inter_sig ~ "Microhabitat only",
+      !micro_sig & site_sig & !inter_sig ~ "Site only",
+      !micro_sig & !site_sig & inter_sig ~ "Interaction only",
+      micro_sig & site_sig & !inter_sig ~ "Microhabitat + Site",
+      micro_sig & !site_sig & inter_sig ~ "Microhabitat + Interaction",
+      !micro_sig & site_sig & inter_sig ~ "Site + Interaction",
+      micro_sig & site_sig & inter_sig ~ "All three",
+      TRUE ~ "Not significant"
+    )
+  ) %>%
+  dplyr::count(category)
+
+overlap_summary_sig <- overlap_summary %>%
+  dplyr::filter(category != "Not significant") # filters out “Not significant” from dominating the plot
+
+ggplot(overlap_summary_sig,
+       aes(x = reorder(category, n),
+           y = n,
+           fill = category)) +
+  geom_col() +
+  coord_flip() +
+  theme_bw() +
+  theme(panel.grid = element_blank()) +
+  labs(
+    x = "Effect combination",
+    y = "Number of significant families")
+
+
+# SET REFERENCE SITES:
+ds2zeros$SiteName <- relevel(ds2zeros$SiteName, "OTI01")
+ds2zeros$Sample_location <- relevel(ds2zeros$Sample_location, "Inner")
+
+geoMeans = apply(counts(ds2zeros), 1, gm_mean)
+ds2zeros = estimateSizeFactors(ds2zeros, geoMeans = geoMeans)
+dsq = DESeq(ds2zeros, fitType="local")
+resultsNames(dsq)
+
+#Get all interaction coefficient names:
+interaction_terms <- resultsNames(dsq)[grep("SiteName.*Sample_location", resultsNames(dsq))]
+
+# Loop through interaction terms:
+interaction_list <- lapply(interaction_terms, function(term) {
+    res <- results(dsq,
+    name = term,
+    cooksCutoff = FALSE,
+    tidy = TRUE)
+    res %>%
+    filter(padj < alpha) %>%
+    mutate(term = term)
+})
+
+resultstax <- as.data.frame(tax_table(ps.fam)@.Data)
+resultstax <- rownames_to_column(resultstax, var = "SampleID") 
+
+tax_clean <- resultstax %>%
+  select(SampleID, Kingdom, Phylum, Class, Order, Family) %>%
+  distinct(SampleID, .keep_all = TRUE)
+
+# Interaction results
+interaction_df <- bind_rows(interaction_list) %>%
+  filter(padj < alpha) %>%
+  left_join(tax_clean, by = c("row" = "SampleID")) %>%
+  mutate(
+    Site = gsub("SiteName(.*?)\\..*", "\\1", term),
+    Microhabitat = case_when(
+      grepl("Edge", term) ~ "Edge vs Inner",
+      grepl("Outer", term) ~ "Outer vs Inner"
+    )
+  )
+
+get_outer_vs_edge_site <- function(site) {
+  base_terms <- c(
+    "Sample_location_Outer_vs_Inner",
+    "Sample_location_Edge_vs_Inner"
+  )
+  if (site == "OTI01") {
+    contrast_list <- list(
+      c(base_terms[1]),
+      c(base_terms[2])
+    )
+  } else {
+    contrast_list <- list(
+      c(base_terms[1], paste0("SiteName", site, ".Sample_locationOuter")),
+      c(base_terms[2], paste0("SiteName", site, ".Sample_locationEdge"))
+    )
+  }
+  results(dsq,
+          contrast = contrast_list,
+          cooksCutoff = FALSE,
+          tidy = TRUE) %>%
+    mutate(Site = site,
+           Microhabitat = "Outer vs Edge")
+}
+
+outer_edge_site <- lapply(levels(dsq$SiteName), get_outer_vs_edge_site) %>%
+  bind_rows() %>%
+  filter(!is.na(log2FoldChange), padj < alpha) %>%
+  left_join(tax_clean, by = c("row" = "SampleID"))
+
+#Combine
+plot_data <- bind_rows(interaction_df, outer_edge_site) %>%
+  mutate(
+    Class = trimws(as.character(Class)),
+    Class_Order_Family = paste(Class, Order, Family, sep = "_")
+  ) %>%
+  filter(!is.na(Class))
+
+n_distinct(plot_data$Class_Order_Family) #114
+
+top5 <- plot_data %>%
+  mutate(absLFC = abs(log2FoldChange)) %>%
+  group_by(Microhabitat) %>%
+  arrange(desc(absLFC), .by_group = TRUE) %>%
+  distinct(Class_Order_Family, .keep_all = TRUE) %>%
+  slice_head(n = 10) %>% # <-- top 10 WITHIN each group
+  ungroup()
+
+taxon_order <- top5 %>%
+  group_by(Class_Order_Family) %>%
+  summarise(max_lfc = max(log2FoldChange, na.rm = TRUE)) %>%
+  arrange(max_lfc) %>%   # smallest → largest
+  pull(Class_Order_Family)
+
+top5 <- top5 %>%
+  mutate(Class_Order_Family = factor(Class_Order_Family,
+                                     levels = taxon_order))
+```
+
+#### Plot
+```{r}
+ps.gen <- tax_glom(ps.patch, taxrank = "Genus")
+
+gm_mean = function(x, na.rm=TRUE){  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))}
+
+resultstax <- as.data.frame(tax_table(ps.gen)@.Data)
+resultstax <- rownames_to_column(resultstax, var = "SampleID") 
+
+## interaction
+alpha = 0.05
+ds2zeros = phyloseq_to_deseq2(ps.gen, ~ SiteName + Sample_location) 
+
+geoMeans = apply(counts(ds2zeros), 1, gm_mean)
+ds2zeros = estimateSizeFactors(ds2zeros, geoMeans = geoMeans)
+dsq = DESeq(ds2zeros, fitType="local")
+
+res1 <- results(dsq, cooksCutoff = FALSE, contrast = c("Sample_location", "Inner", "Edge"), tidy = TRUE) %>%
+  filter(padj < alpha) %>%
+  left_join(., resultstax, by = c("row" = "SampleID")) %>%
+  mutate(test = "Inner vs. Edge")
+
+res2 <- results(dsq, cooksCutoff = FALSE, contrast = c("Sample_location", "Inner", "Outer"), tidy = TRUE) %>%
+  filter(padj < alpha) %>%
+  left_join(., resultstax, by = c("row" = "SampleID")) %>%
+  mutate(test = "Inner vs. Outer")
+
+res3 <- results(dsq, cooksCutoff = FALSE, contrast = c("Sample_location", "Edge", "Outer"), tidy = TRUE) %>%
+  filter(padj < alpha) %>%
+  left_join(., resultstax, by = c("row" = "SampleID")) %>%
+  mutate(test = "Edge vs. Outer")
+
+results.da.order <- rbind(res1, res2, res3) %>%
+  mutate(Genus = fct_reorder(Genus, log2FoldChange))
+
+# unique families
+nlevels(results.da.order$Genus) #183 (site blocking)
+levels(results.da.order$Genus)
+
+# Top 10 per comparison independently
+top10_by_test <- results.da.order %>%
+  filter(!is.na(log2FoldChange)) %>%
+  mutate(absLFC = abs(log2FoldChange)) %>%
+  group_by(test) %>%
+  arrange(desc(absLFC), .by_group = TRUE) %>%
+  distinct(Genus, .keep_all = TRUE) %>%
+  slice_head(n = 10) %>%
+  ungroup()
+
+plot_data <- top10_by_test %>%
+  mutate(Genus = factor(Genus))
+
+plot_data <- top10_by_test %>%
+  mutate(
+    Order_Family_Genus = case_when(
+      !is.na(Order) & !is.na(Family) & !is.na(Genus) ~ 
+        paste(Order, Family, Genus, sep = "_"),
+            !is.na(Order) & !is.na(Family) ~ 
+        paste(Order, Family, sep = "_"),
+            !is.na(Family) & !is.na(Genus) ~ 
+        paste(Family, Genus, sep = "_"),
+            TRUE ~ Family)) %>%
+  mutate(Order_Family_Genus = factor(Order_Family_Genus))
+
+
+library(RColorBrewer)
+n_families <- length(unique(plot_data$Class))
+deseq_colors <- colorRampPalette(brewer.pal(9, "Paired"))(n_families)
+names(deseq_colors) <- unique(plot_data$Class)
+
+ggplot(plot_data, aes(x = log2FoldChange,  y = reorder_within(Order_Family_Genus, -log2FoldChange, row),  fill = Class)) +
+  geom_point(shape = 21,size = 5,  colour = "black", stroke = 0.5) +
+  facet_grid(~ test, scales = "free_x") +
+  scale_fill_manual(values = deseq_colors, name = "Class") +
+  scale_y_reordered() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_bw(base_size = 11) +  theme(aspect.ratio =3/1,  legend.position = "right",  panel.grid.major = element_line(colour = "lightgrey", size = 0.5),  panel.grid.minor = element_line(colour = "lightgrey", size = 0.5),  axis.text = element_text(size = 11, colour = "black"),  axis.title = element_text(size = 11, colour = "black"), strip.text = element_text(size = 11, colour = "black"),  legend.title = element_text(size = 11, colour = "black"),   legend.text = element_text(size = 11, colour = "black") ) +
+  ylab("Order_Family_Genus") +  xlab("Log2 Fold Change")
+```
+
+# 3.  Sediment characteristics in microhabitats
+## Environmental variables 
+```{r}
+# convert to data.frame if phyloseq:
+samptab_df <- data.frame(samptab)
+
+summary_table <- samptab_df %>%
+  dplyr::filter(Experiment %in% c("Patch"), !Sample_type %in% c("Water")) %>% 
+  dplyr::select(Samplename, SiteName, Replicate, Sample_location, TP.mg.kg, TN.mg.kg, TOCpercent, NP, MeanGrainsize,	Sorting,	Skewness,	Kurtosis,	D50um,	D50f,	GRAVELpercent,	SANDpercent,	MUDpercent)
+
+range_summary <- samptab_df %>%
+  summarise(
+    Temperature_range = paste0(round(min(Temp, na.rm=TRUE), 2), " to ", round(max(Temp, na.rm=TRUE), 2)),
+    DissolvedOxygen_range = paste0(round(min(DO, na.rm=TRUE), 2), " to ", round(max(DO, na.rm=TRUE), 2)),
+    pH_range = paste0(round(min(pH, na.rm=TRUE), 2), " to ", round(max(pH, na.rm=TRUE), 2)),
+    Turbidity_range = paste0(round(min(FNU, na.rm=TRUE), 2), " to ", round(max(FNU, na.rm=TRUE), 2)),
+    Maxdepth_range = paste0(round(min(MaxDepth.m, na.rm=TRUE), 2), " to ", round(max(MaxDepth.m, na.rm=TRUE), 2)),)
+```
+
+### Stats
+```{r}
+library(dplyr)
+library(nlme)
+library(emmeans)
+library(car)
+library(broom)
+library(purrr)
+
+filtered_df <- samptab_df %>%
+  filter(Experiment == "Patch", Sample_type != "Water") %>%
+  mutate(Sample_location = factor(Sample_location, levels = c("Inner", "Edge", "Outer")), SiteName = droplevels(factor(SiteName)))
+
+variables <- c("TP.mg.kg", "TN.mg.kg", "TOCpercent", "MeanGrainsize", "D50um", "GRAVELpercent", "SANDpercent", "MUDpercent")
+
+# Model loop: Fits model: Variable ~ Sample_location + (1|SiteName), Checks residual diagnostics, Tests normality, Provides ANOVA table, Gives pairwise contrasts, model_results <- list()
+results_list <- list()
+anova_pvalues <- c()
+
+for (var in variables) {
+  
+  cat("\n==============================\n")
+  cat("Variable:", var, "\n")
+  cat("==============================\n")
+  
+  dat <- filtered_df %>%
+    select(SiteName, Sample_location, all_of(var)) %>%
+    filter(!is.na(.data[[var]]))
+  
+  formula_fixed <- as.formula(paste(var, "~ Sample_location"))
+  
+  model <- lme(
+    fixed = formula_fixed,
+    random = ~1 | SiteName,
+    data = dat,
+    method = "ML"
+  )
+  
+  # ASSUMPTION CHECKS
+  res <- residuals(model, type = "normalized")
+  
+  shapiro_p <- shapiro.test(res)$p.value
+  
+  levene_p <- car::leveneTest(
+    dat[[var]] ~ dat$Sample_location
+  )[1, "Pr(>F)"]
+  
+  transformed <- FALSE
+  
+  #  If assumptions violated → log transform 
+  if (shapiro_p < 0.05 | levene_p < 0.05) {
+    
+    cat("Assumptions violated → applying log transformation\n")
+    
+    dat[[var]] <- log(dat[[var]] + 1)
+    
+    model <- lme(
+      fixed = formula_fixed,
+      random = ~1 | SiteName,
+      data = dat,
+      method = "ML"
+    )
+    
+    res <- residuals(model, type = "normalized")
+    shapiro_p <- shapiro.test(res)$p.value
+    levene_p <- car::leveneTest(
+      dat[[var]] ~ dat$Sample_location
+    )[1, "Pr(>F)"]
+    
+    transformed <- TRUE
+  }
+  
+  # ANOVA
+  anova_table <- anova(model)
+  p_value <- anova_table$`p-value`[1]
+  anova_pvalues <- c(anova_pvalues, p_value)
+  
+  pairwise <- emmeans(model, pairwise ~ Sample_location,
+                      adjust = "tukey")
+  
+  print(anova_table)
+  print(pairwise)
+  
+  results_list[[var]] <- list(
+    model = model,
+    anova = anova_table,
+    pairwise = pairwise,
+    shapiro_p = shapiro_p,
+    levene_p = levene_p,
+    transformed = transformed
+  )
+}
+
+fdr_p <- p.adjust(anova_pvalues, method = "BH")
+names(fdr_p) <- variables
+
+summary_table <- data.frame(
+  Variable = variables,
+  F_value = sapply(results_list,
+                   function(x) x$anova$`F-value`[1]),
+  df1 = sapply(results_list,
+               function(x) x$anova$numDF[1]),
+  df2 = sapply(results_list,
+               function(x) x$anova$denDF[1]),
+  p_value = anova_pvalues,
+  FDR_p = fdr_p,
+  Shapiro_p = sapply(results_list, function(x) x$shapiro_p),
+  Levene_p = sapply(results_list, function(x) x$levene_p),
+  Log_transformed = sapply(results_list, function(x) x$transformed))
+```
+
+### Plot
+```{r}
+# Combine ANOVA results with summary stats
+summary_table_clean <- summary_table %>%
+  mutate(F_value = as.numeric(F_value), df1 = as.numeric(df1), df2 = as.numeric(df2), p_value = as.numeric(p_value),
+    Log_transformed = as.logical(Log_transformed)) %>%  select(Variable, F_value, df1, df2, p_value, Log_transformed)
+
+# Join with summary_long
+summary_plot_df <- summary_long %>%
+  left_join(summary_table_clean, by = "Variable") %>%
+  mutate(anova_label = paste0("F(", df1, ",", round(df2,1), ") = ", round(F_value,2), ifelse(p_value < 0.001, ", p < 0.001", paste0(", p = ", round(p_value,3))), ifelse(Log_transformed, " (log-transformed)", "")))
+
+# Ensure anova_label is character
+summary_plot_df <- summary_plot_df %>% mutate(anova_label = as.character(anova_label))
+
+# Create label_df with one label per variable
+label_df <- summary_plot_df %>%
+  group_by(Variable) %>%
+  summarise(y_pos = max(mean + se, na.rm = TRUE), anova_label = anova_label[1], .groups = "drop") %>%
+  mutate(x_pos = 2)  # middle position (assuming 1=Inner, 2=Edge, 3=Outer)
+
+library(dplyr)
+library(emmeans)
+library(multcompView)
+
+# Create a dataframe with letters
+letter_df <- lapply(names(results_list), function(var) {
+  pw <- results_list[[var]]$pairwise$contrasts  # emmeans pairwise results
+  cld_res <- multcomp::cld(results_list[[var]]$pairwise$emmeans,
+                           Letters = letters,
+                           adjust = "tukey")
+  cld_res <- as.data.frame(cld_res)
+  cld_res <- cld_res %>%
+    select(Sample_location, .group) %>%
+    mutate(Variable = var)
+  return(cld_res)}) %>%
+  bind_rows()
+
+plot_df <- summary_long %>%  left_join(letter_df, by = c("Sample_location", "Variable"))
+
+ggplot(plot_df, aes(x = Sample_location, y = mean)) +
+  geom_col(fill = "skyblue2") +  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.2) +
+  geom_text(aes(x = x_pos, y = y_pos, label = anova_label), data = label_df, inherit.aes = FALSE, size = 3, hjust = 0.5) +
+  geom_text(aes(y = mean + se, label = .group), size = 3, vjust = -0.2) +
+  facet_wrap(~ Variable, scales = "free_y", ncol = 4) +
+  labs(x = "Microhabitat", y = "Mean ± SE") +
+  theme_bw() +  theme(strip.text = element_text(face = "bold"), aspect.ratio = 1)
+```
+
+# 4. Bacterial diversity and community structure of sediment vs. seawater
+## Beta diversity
+```{r echo=TRUE, tidy=TRUE, tidy.opts=list(width.cutoff=60)}
+
+ps <- readRDS("ps.all.rds")
+
+trans.adonis <- microbiome::transform(ps, transform = "hellinger", target = "OTU", shift = 0, scale = 1)
+
+unifrac <- phyloseq::distance(trans.adonis, method = "wunifrac")
+sampledf <- data.frame(sample_data(trans.adonis))
+
+# ADONIS
+adonis2(formula = unifrac ~ Sample_type, data = sampledf)
+
+# Sample_type
+beta.sampletype <- betadisper(unifrac, sampledf$Sample_type)
+boxplot(beta.sampletype)
+
+anova(beta.sampletype)
+beta.HSD <- TukeyHSD(beta.sampletype)
+plot(beta.HSD) 
+  
+plot(beta.sampletype)
+permutest(beta.sampletype, pairwise = TRUE, permutations = 999)
+```
+
+## Alpha diversity
+```{r}
+library(rstatix)
+
+sample_sums(ps)
+
+reads_per_sample <- tibble(
+  SampleID = sample_names(ps),
+  Reads    = sample_sums(ps))
+
+reads_per_sample
+
+mean(sample_sums(ps)) 
+summary(sample_sums(ps))
+
+r <- rarefy_even_depth(ps, sample.size = 21481, verbose = FALSE, replace = TRUE) # rarify to 21481 1st quartile
+
+# prune OTUs that are not present in any of the samples, using rarefied data
+ps.pruned <- prune_taxa(taxa_sums(r) > 0, r)
+
+# Plot
+alpha <- plot_richness(ps.pruned,  x = "Sample_type", measures = c("Shannon", "Chao1", "Observed")) +
+  geom_boxplot(aes(fill = Sample_type), outlier.size = 0.2) +
+  scale_fill_manual(values = c("Water" = "cornflowerblue",  "Sediment" = "orange")) +
+  #geom_jitter(width = 0.2, size = 1, color = "black") +   # black points
+  theme_bw() +  theme(legend.position = "right", aspect.ratio = 1.5,  text = element_text(size = 11),axis.text.y = element_text(colour = "black", size = 11),       axis.title.y = element_text(colour = "black", size = 11), legend.title = element_text(size = 11), legend.text = element_text(size = 11),panel.grid.minor = element_line(size = 0.5), panel.grid.major = element_line(size = 0.5), axis.text.x = element_blank(),  axis.title.x = element_blank()) + ylab("Alpha diversity") + xlab("Sample type")
+```
+
+### Chao1
+```{r}
+library(car)
+library(rstatix)
+
+results.chao = estimate_richness(ps.pruned, measures = 'Chao1')
+
+results.chao <- results.chao %>%
+  tibble::rownames_to_column(var = "SampleID")
+  results.chao$SampleID <- str_replace(results.chao$SampleID, "Alt", "XAlt")
+  results.chao$SampleID <- str_replace(results.chao$SampleID, "Apr", "XApr")
+  results.chao$SampleID <- str_replace(results.chao$SampleID, "Int", "XInt")
+  results.chao$SampleID <- str_replace(results.chao$SampleID, "OR1", "XOR1")
+
+meta <- data.frame(SampleID = sample_data(ps.pruned)$SampleID,  Sample_type = sample_data(ps.pruned)$Sample_type)
+  meta$SampleID <- str_replace(meta$SampleID, "^", "X")
+  meta$SampleID <- str_replace(meta$SampleID, "-", ".")
+  meta$SampleID <- str_replace(meta$SampleID, "-E", ".E")
+  meta$SampleID <- str_replace(meta$SampleID, "-I", ".I")
+  meta$SampleID <- str_replace(meta$SampleID, "-O", ".O")
+  meta$SampleID <- str_replace(meta$SampleID, "-W", ".W")
+
+results.chao <- left_join(results.chao, meta)
+
+Chao.summary <- results.chao %>%
+                    group_by(Sample_type) %>% 
+                    get_summary_stats(Chao1, type = "common")
+
+res.chao.aov <- aov(Chao1 ~ Sample_type, data = results.chao) 
+
+summary(res.chao.aov)
+
+TukeyHSD(res.chao.aov)
+
+leveneTest(Chao1 ~ Sample_type, data = results.chao) 
+
+# Check normality
+plot(res.chao.aov, 1)
+plot(res.chao.aov, 2) 
+aov_residuals <- residuals(object = res.chao.aov) 
+shapiro.test(x = aov_residuals)
+```
+
+### Shannon
+```{r}
+results.shan = estimate_richness(ps.pruned, measures = 'Shannon')
+
+results.shan <- results.shan %>%
+  tibble::rownames_to_column(var = "SampleID")
+
+meta <- data.frame(SampleID = sample_data(ps.pruned)$SampleID, 
+                   Sample_type = sample_data(ps.pruned)$Sample_type)
+
+results.shan <- left_join(results.shan, meta)
+
+Shan.summary <- results.shan %>%
+                    group_by(Sample_type) %>% 
+                    get_summary_stats(Shannon, type = "common") 
+
+leveneTest(Shannon ~ Sample_type, data = results.shan) 
+
+# Check normality
+plot(res.shan.aov, 1) 
+plot(res.shan.aov, 2)
+aov_residuals <- residuals(object = res.shan.aov)
+shapiro.test(x = aov_residuals) # 0.0000000000001224 assumption of normality IS NOT satisfied under shapiros
+
+kruskal.test(Shannon ~ Sample_type, data = results.shan)
+```
+
+## Relative abundance
+```{r}
+glom <- tax_glom(ps, taxrank = "Phylum")
+
+#Sediment
+Sediment <- subset_samples(ps.phylum, Sample_type == "Sediment")
+Sediment <- transform_sample_counts(Sediment, function(x) x/sum(x)*100)
+Sediment <- filter_taxa(Sediment, function(x) mean(x) > 0.01, TRUE)
+
+Sediment <- psmelt(Sediment) %>%
+  group_by(Sample_type, Phylum) %>%
+  summarise(
+    Relative_abun = mean(Abundance),
+    SE_rel = sd(Abundance) / sqrt(n()),
+    .groups = "drop")
+
+#Water
+Water <- subset_samples(ps.phylum, Sample_type == "Water")
+Water <- transform_sample_counts(Water, function(x) x/sum(x)*100)
+Water <- filter_taxa(Water, function(x) mean(x) > 0.01, TRUE)
+
+Water <- psmelt(Water) %>%
+  group_by(Sample_type, Phylum) %>%
+  summarise(
+    Relative_abun = mean(Abundance),
+    SE_rel = sd(Abundance) / sqrt(n()),
+    .groups = "drop")
+```
+
+## DESeq2
+```{r}
+ps.fam <- tax_glom(ps, taxrank = "Phylum")
+
+# DESeq2 setup
+gm_mean <- function(x, na.rm=TRUE){ exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x)) }
+
+dds <- phyloseq_to_deseq2(ps.fam, ~ Sample_type)
+geoMeans <- apply(counts(dds), 1, gm_mean)
+dds <- estimateSizeFactors(dds, geoMeans = geoMeans)
+
+dds <- DESeq(dds, fitType="local")
+
+res <- results(dds,
+               cooksCutoff = FALSE,
+               contrast = c("Sample_type", "Sediment", "Water"))
+
+res_df <- as.data.frame(res)
+res_df$taxon <- rownames(res_df)
+
+# Attach taxonomy 
+tax_df <- as.data.frame(tax_table(ps.fam))
+tax_df$taxon <- rownames(tax_df)
+
+res_df_tax <- merge(res_df, tax_df, by = "taxon", all.x = TRUE)
+#write.csv(res_df_tax, "deseqNEW.csv")
+
+# Filter top 10 families per habitat based on abs(log2FC) 
+res_df_tax <- res_df_tax %>%
+  mutate(
+    Enriched_in = case_when(
+      log2FoldChange > 0 ~ "Sediment",
+      log2FoldChange < 0 ~ "Water",
+      TRUE ~ NA_character_))
+
+# Select top 10 families per habitat
+top_families <- res_df_tax %>%
+  filter(!is.na(Enriched_in)) %>%
+  group_by(Enriched_in) %>%
+  arrange(desc(abs(log2FoldChange))) %>%
+  distinct(Family, .keep_all = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(Family)
+
+plot_data <- res_df_tax %>%
+  filter(Family %in% top_families) %>%
+  mutate(Family = factor(Family, levels = top_families))
+
+# color palette
+library(RColorBrewer)
+n_orders <- length(unique(plot_data$Class))
+deseq_colors <- colorRampPalette(brewer.pal(10, "Paired"))(n_orders)
+names(deseq_colors) <- unique(plot_data$Class)
+
+ggplot(plot_data, aes(x = log2FoldChange,  y = reorder_within(Family, log2FoldChange, Enriched_in),   fill = Class)) +
+  geom_point(shape = 21, size = 8, colour = "black", stroke = 0.5) +
+  scale_fill_manual(values = deseq_colors, name = "Class") +
+  scale_y_reordered() +  geom_vline(xintercept = 0, linetype = "dashed") +  theme_bw(base_size = 11) +
+  theme(aspect.ratio = 1,  legend.position = "right",  panel.grid.major = element_line(colour = "lightgrey", size = 0.5),  panel.grid.minor = element_line(colour = "lightgrey", size = 0.5),  axis.text = element_text(size = 11, colour = "black"), axis.title = element_text(size = 11, colour = "black"),    strip.text = element_text(size = 11, colour = "black"),  legend.title = element_text(size = 11, colour = "black"),
+    legend.text = element_text(size = 11, colour = "black")) +  ylab("Family") +  xlab("Log2 Fold Change")
+```
+
+### Prevalence: Venns
+```{r}
+ps.fam <- tax_glom(ps, taxrank = "Family")
+
+ps.fam <- prune_taxa(taxa_sums(ps.fam) > 0, ps.fam) 
+
+otu_mat <- otu_table(ps.fam)
+if(!taxa_are_rows(ps.fam)) otu_mat <- t(otu_mat)
+
+prev <- rowSums(otu_mat > 0) 
+
+# Prune taxa present in >= 5% of samples
+ps.fam <- prune_taxa(prev >= 0.05 * nsamples(ps.fam), ps.fam) 
+
+# Subset by Sample_type
+ps.sed <- subset_samples(ps.fam, Sample_type == "Sediment")
+
+ps.wat <- subset_samples(ps.fam, Sample_type == "Water")
+
+# Presence–absence
+pa.sed <- taxa_names(ps.sed)[taxa_sums(ps.sed) > 0]
+pa.wat <- taxa_names(ps.wat)[taxa_sums(ps.wat) > 0]
+
+unique.sediment <- setdiff(pa.sed, pa.wat)
+length(unique.sediment) #208 families were detected only in sediments
+
+unique.water    <- setdiff(pa.wat, pa.sed)
+length(unique.water) #10 families were detected only in water
+
+shared.taxa     <- intersect(pa.sed, pa.wat)
+length(shared.taxa) #582 families were shared between habitats
+
+shared_tax_table <- tax_table(ps.sed)[shared.taxa, , drop = FALSE]
+shared_tax_df <- as.data.frame(shared_tax_table)
+
+otu <- as(otu_table(ps.fam), "matrix")
+
+if (!taxa_are_rows(ps.fam)) {
+  otu <- t(otu)
+}
+
+meta <- as.data.frame(sample_data(ps.fam))
+
+prev.df <- data.frame(
+  Taxon = taxa_names(ps.fam),
+  Prev_Sediment = apply(otu[, meta$Sample_type == "Sediment"], 1, function(x) mean(x > 0)),
+  Prev_Water    = apply(otu[, meta$Sample_type == "Water"], 1, function(x) mean(x > 0)))
+
+prev.df <- prev.df %>%
+  mutate(
+    Unique_Sediment = Prev_Sediment > 0 & Prev_Water == 0,
+    Unique_Water    = Prev_Water > 0 & Prev_Sediment == 0)
+
+library(ggvenn)
+
+venn.list <- list(Sediment = pa.sed, Water = pa.wat)
+
+ggvenn(venn.list,  fill_color = c("sienna3", "steelblue3"),  stroke_size = 0.8,  set_name_size = 5,  text_size = 5) 
+```
+
+### Rel abund plot of prevalent taxa
+```{r}
+ps.fam <- tax_glom(ps, taxrank = "Family")
+ps.fam <- prune_taxa(taxa_sums(ps.fam) > 0, ps.fam) 
+
+N <- 10  # number of most prevalent families per habitat
+
+# the most prevalent families within each habitat, based strictly on detection frequency
+top_prev <- prev.df |>
+  select(Family, Prev_Sediment, Prev_Water) |>
+  pivot_longer(
+    cols = c(Prev_Sediment, Prev_Water),
+    names_to = "Habitat",
+    values_to = "Prevalence"
+  ) |>
+  mutate(
+    Habitat = recode(
+      Habitat,
+      Prev_Sediment = "Sediment",
+      Prev_Water    = "Water"
+    )
+  ) |>
+  group_by(Habitat) |>
+  slice_max(Prevalence, n = N, with_ties = FALSE) |>
+  ungroup()
+
+library(phyloseq)
+library(dplyr)
+library(tidyr)
+
+ps.family.rel <- transform_sample_counts(ps.fam, function(x) x / sum(x))
+
+relabun_df <- psmelt(ps.family.rel) |>
+  filter(Family %in% top_prev$Family) |>
+  group_by(Sample_type, Family) |>
+  summarise(
+    Mean_rel_abun = mean(Abundance) * 100,
+    .groups = "drop")
+
+relabun_df <- relabun_df |>  inner_join(top_prev, by = c("Sample_type" = "Habitat", "Family" = "Family"))
+
+relabun_df <- relabun_df |>  mutate(Family = reorder_within(Family, Mean_rel_abun, Sample_type, desc = TRUE))
+
+library(RColorBrewer)
+families_plot <- unique(relabun_df$Family)
+base_cols <- brewer.pal(12, "Paired")
+paired_cols <- colorRampPalette(base_cols)(length(families_plot))
+names(paired_cols) <- families_plot
+
+ggplot(relabun_df, aes(x = Family, y = Mean_rel_abun, fill = Family)) +
+  geom_col(colour = "black", width = 0.8) +  coord_flip() +  facet_wrap(~Sample_type, scales = "free") +  scale_fill_manual(values = paired_cols) + scale_x_reordered() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +  theme_bw(base_size = 11) +  theme(legend.position = "none",  axis.text = element_text(colour = "black"),  axis.title = element_text(colour = "black"),strip.text = element_text(size = 12)) +  labs(x = "Family",y = "Mean relative abundance (%)",  title = "Most prevalent microbial families by habitat",  subtitle = "Top 10 families selected independently for sediment and seawater")
+```
+
+# 5. Physicochemical measurements
+## Environmental factors (temp, salinity etc per site)
+```{r}
+samptab_df <- data.frame(samptab)
+
+# check your replicate column name; adjust if necessary
+summary_table <- samptab_df %>%
+  dplyr::filter(Replicate == 1, !Sample_location %in% c("Negative", "Blank", "Water"), !Sample_location %in% c("Edge", "Outer")) %>%
+  dplyr::select(SiteName, Reef_area, Lat, Long, Temp, DO, pH, MaxDepth.m)
+
+#write.csv(summary_table, "Environmental factors_summary.csv", row.names = FALSE)
+
+range_summary <- samptab_df %>%
+  summarise(
+    Temperature_range = paste0(round(min(Temp, na.rm=TRUE), 2), " to ", round(max(Temp, na.rm=TRUE), 2)),
+    DissolvedOxygen_range = paste0(round(min(DO, na.rm=TRUE), 2), " to ", round(max(DO, na.rm=TRUE), 2)),
+    pH_range = paste0(round(min(pH, na.rm=TRUE), 2), " to ", round(max(pH, na.rm=TRUE), 2)),
+    Maxdepth_range = paste0(round(min(MaxDepth.m, na.rm=TRUE), 2), " to ", round(max(MaxDepth.m, na.rm=TRUE), 2)),)
+```
+
+## Chlorophyll
+```{r}
+samptab <- read.csv("metadataOTI.csv", header = TRUE)
+rownames(samptab) <- samptab$SampleID
+samptab_df <- data.frame(samptab)
+
+samples_chl <- samptab[complete.cases(samptab[, c("Chla", "Pheo", "ChlPheo")]), ]
+
+summary_table <- samples_chl %>%
+  group_by(SiteName) %>%
+  summarise(
+    n = n(),
+    Chla_mean = mean(Chla, na.rm = TRUE),
+    Chla_SE = sd(Chla, na.rm = TRUE) / sqrt(n()),
+    Pheo_mean = mean(Pheo, na.rm = TRUE),
+    Pheo_SE = sd(Pheo, na.rm = TRUE) / sqrt(n()),
+    ChlPheo_mean = mean(ChlPheo, na.rm = TRUE),
+    ChlPheo_SE = sd(ChlPheo, na.rm = TRUE) / sqrt(n()))
+
+library(dplyr)
+library(tidyr)
+library(car)
+
+anova_chla <- aov(Chla ~ SiteName, data = samples_chl)
+summary(anova_chla)
+
+
+anova_pheo <- aov(Pheo ~ SiteName, data = samples_chl)
+summary(anova_pheo)
+
+kruskal_chlpheo <- kruskal.test(ChlPheo ~ SiteName, data = samples_chl)
+kruskal_chlpheo
+
+# Function to check assumptions
+check_anova_assumptions <- function(df, var) {
+  formula <- as.formula(paste(var, "~ SiteName"))
+  aov_res <- aov(formula, data = df)
+  
+  # 1. Normality of residuals (Shapiro-Wilk test)
+  shapiro_res <- shapiro.test(residuals(aov_res))
+  
+  # 2. Homogeneity of variance (Levene's Test)
+  levene_res <- leveneTest(formula, data = df)
+  
+  list(shapiro = shapiro_res, levene = levene_res)
+}
+
+# Check for Chla
+check_anova_assumptions(samples_chl, "Chla") # ok both .0.05
+
+# Check for Pheo
+check_anova_assumptions(samples_chl, "Pheo") # ok both .0.05
+
+# Check for ChlPheo
+check_anova_assumptions(samples_chl, "ChlPheo") # not normal - use Kruskal
+
+# Plot
+summary_long <- summary_table %>%
+  pivot_longer(
+    cols = c(Chla_mean, Pheo_mean, ChlPheo_mean, Chla_SE, Pheo_SE, ChlPheo_SE),
+    names_to = c("variable", ".value"),
+    names_pattern = "(Chla|Pheo|ChlPheo)_(.*)")
+
+summary_long$variable <- factor(
+  summary_long$variable,
+  levels = c("Chla", "Pheo", "ChlPheo"))
+
+SiteNames <- sort(unique(summary_long$SiteName))
+
+site_order <- c("Alt1", "Alt2", "Alt3", "Alt4", "Int1", "Int2", "OTI01", "OTI03", "OTI05", "OTI06", "OTI07", "OTI08", "OTI10", "OTI12", "OTI15", "OTI16", "OTI18", "OTI19", "SA1", "SA2", "SA3")
+
+facet_labels <- c(
+  Chla = "Chlorophyll a (mg/mL)",
+  Pheo = "Pheophytin a (mg/mL)",
+  ChlPheo = "Chlorophyll:Pheophytin ratio")
+
+ggplot(summary_long, aes(x = SiteName, y = mean)) +
+  geom_col(fill = "grey85", width = 0.8) +
+  geom_errorbar(aes(ymin = mean - SE, ymax = mean + SE),    width = 0.3, linewidth = 0.5) +
+  facet_wrap(~variable, scales = "free_y",labeller = labeller(variable = facet_labels),  nrow = 1) +
+  labs(x = "Site", y = "Mean ± SE") +  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  theme_bw(base_size = 11) +  theme(aspect.ratio = 1, legend.position = "none",  axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),axis.text.y = element_text(colour = "black", size = 11),
+    axis.title.x = element_text(colour = "black", size = 11),  axis.title.y = element_text(colour = "black", size = 11))
+```
+
+
